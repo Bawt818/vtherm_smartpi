@@ -780,6 +780,108 @@ def _decision(manager, **overrides):
 
 
 class TestSetpointLanding:
+    @staticmethod
+    def _tracking_plateau_manager():
+        manager = _make_manager()
+        manager.load_state(
+            {
+                "last_user_target_temp": 25.0,
+                "filtered_setpoint": 25.0,
+                "effective_setpoint": 24.92,
+                "trajectory_active": True,
+                "trajectory_source": "setpoint",
+                "trajectory_phase": TrajectoryPhase.TRACKING.value,
+                "trajectory_start_setpoint": 25.0,
+                "trajectory_target_setpoint": 24.9,
+                "trajectory_tau_ref_min": 10.0,
+                "trajectory_current_setpoint": 24.92,
+            }
+        )
+        return manager
+
+    @staticmethod
+    def _tracking_plateau_step(
+        manager, now, *, slope=0.02, hvac_mode=VThermHvacMode_HEAT, current=24.92
+    ):
+        return manager.filter_setpoint(
+            target_temp=25.0,
+            current_temp=current,
+            hvac_mode=hvac_mode,
+            a=0.075,
+            b=0.0034,
+            ext_current_temp=15.0,
+            u_ref=1.0,
+            deadtime_cool_s=765.0,
+            deadtime_cool_reliable=True,
+            tau_reliable=True,
+            deadband_c=0.05,
+            kp=1.45,
+            next_cycle_u_ref=1.0,
+            cycle_min=2.0,
+            remaining_cycle_min=1.0,
+            now_monotonic=now,
+            u_ff_eff=0.39,
+            ki=0.0048,
+            integral=-43.0,
+            temperature_slope_h=slope,
+        )
+
+    def test_stable_tracking_plateau_enters_release_without_setpoint_jump(self):
+        manager = self._tracking_plateau_manager()
+        first = self._tracking_plateau_step(manager, 0.0)
+        self._tracking_plateau_step(manager, 60.0)
+        repeated = self._tracking_plateau_step(manager, 60.0)
+
+        assert manager.trajectory_phase == TrajectoryPhase.TRACKING
+        assert manager.landing_release_allowed is True
+        assert manager.landing_coast_required is False
+        assert repeated == pytest.approx(manager.effective_setpoint)
+
+        before = manager.effective_setpoint
+        transition = self._tracking_plateau_step(manager, 120.0)
+
+        assert first < 25.0
+        assert manager.trajectory_braking_needed is True
+        assert manager.trajectory_phase == TrajectoryPhase.RELEASE
+        assert manager.trajectory_target_setpoint == pytest.approx(25.0)
+        assert transition == pytest.approx(before)
+
+        self._tracking_plateau_step(manager, 180.0)
+        assert manager.trajectory_phase == TrajectoryPhase.RELEASE
+        assert manager.landing_reason == "residual_release"
+
+        final = self._tracking_plateau_step(manager, 720.0, current=24.96)
+        assert final == pytest.approx(25.0)
+        assert manager.trajectory_phase == TrajectoryPhase.IDLE
+
+    def test_fast_slope_interrupts_tracking_release_candidate(self):
+        manager = self._tracking_plateau_manager()
+        self._tracking_plateau_step(manager, 0.0)
+        self._tracking_plateau_step(manager, 60.0, slope=2.4)
+        self._tracking_plateau_step(manager, 120.0)
+
+        assert manager.trajectory_phase == TrajectoryPhase.TRACKING
+        assert manager._landing_tracking_release_count == 1
+
+    def test_missing_temperature_resets_tracking_release_candidate(self):
+        manager = self._tracking_plateau_manager()
+        self._tracking_plateau_step(manager, 0.0)
+        manager.filter_setpoint(target_temp=25.0, current_temp=None)
+        self._tracking_plateau_step(manager, 120.0)
+
+        assert manager.trajectory_phase == TrajectoryPhase.TRACKING
+        assert manager._landing_tracking_release_count == 1
+
+    def test_cool_tracking_does_not_use_heat_landing_release(self):
+        manager = self._tracking_plateau_manager()
+        for now in (0.0, 60.0, 120.0):
+            self._tracking_plateau_step(
+                manager, now, hvac_mode=VThermHvacMode_COOL, current=25.08,
+            )
+
+        assert manager._landing_tracking_release_count == 0
+        assert manager.landing_reason == "cool_unsupported"
+
     def test_landing_inactive_when_model_unreliable(self):
         manager = _make_manager()
         manager._trajectory_source = "setpoint"

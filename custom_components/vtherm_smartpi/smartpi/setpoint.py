@@ -11,6 +11,7 @@ from .const import (
     LANDING_ENABLE_ERROR_THRESHOLD_C,
     LANDING_MIN_HORIZON_MIN,
     LANDING_NON_CONSTRAINING_PERSISTENCE,
+    LANDING_TRACKING_RELEASE_PERSISTENCE,
     LANDING_RELEASE_SLOPE_H,
     LANDING_RELEASE_TIME_TO_DEADTIME_RATIO,
     LANDING_RELEASE_TIME_TO_TARGET_EPS_MIN,
@@ -30,7 +31,7 @@ from .const import (
     clamp,
 )
 from .trajectory import SmartPITrajectoryGenerator
-from ..hvac_mode import VThermHvacMode, VThermHvacMode_COOL
+from ..hvac_mode import VThermHvacMode, VThermHvacMode_COOL, VThermHvacMode_HEAT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ class SmartPISetpointManager:
         self.enabled = enabled
         self._release_tau_factor = max(float(release_tau_factor), 0.01)
 
-        # Tracks the latest raw target for change detection
+        # Public target value; the shaped P reference lives in effective_setpoint.
         self.filtered_setpoint: Optional[float] = None
         # Actual SP_for_P value returned to the controller
         self.effective_setpoint: Optional[float] = None
@@ -96,12 +97,15 @@ class SmartPISetpointManager:
         self._last_bumpless_ready: bool | None = None
         self._trajectory_source: str = "none"
 
-        # Setpoint landing state (HEAT-only, transient — never persisted)
+        # HEAT landing decisions and release candidates are runtime-only.
         self._landing_decision = SetpointLandingDecision()
         self._landing_residual_released: bool = False
         self._landing_non_constraining_count: int = 0
         self._landing_time_to_target_min: float | None = None
         self._landing_release_blocked_by_slope: bool = False
+        self._landing_tracking_release_since: float | None = None
+        self._landing_tracking_release_last: float | None = None
+        self._landing_tracking_release_count: int = 0
 
     @property
     def trajectory_active(self) -> bool:
@@ -260,7 +264,59 @@ class SmartPISetpointManager:
         self._landing_decision = SetpointLandingDecision()
         self._landing_residual_released = False
         self._landing_non_constraining_count = 0
+        self._reset_landing_tracking_release()
         self._reset_landing_release_safety()
+
+    def _reset_landing_tracking_release(self) -> None:
+        self._landing_tracking_release_since = None
+        self._landing_tracking_release_last = None
+        self._landing_tracking_release_count = 0
+
+    def _landing_tracking_release_ready(
+        self,
+        *,
+        hvac_mode: VThermHvacMode | None,
+        signed_error: float,
+        temperature_slope_h: float | None,
+        now_monotonic: float,
+        cycle_min: float,
+    ) -> bool:
+        """Confirm a low-slope residual plateau before leaving tracking."""
+        # A single permissive landing decision can reflect a transient slope;
+        # require both repeated decisions and one full control cycle of dwell.
+        eligible = (
+            hvac_mode == VThermHvacMode_HEAT
+            and self.trajectory_phase == TrajectoryPhase.TRACKING
+            and self._trajectory_source == "setpoint"
+            and self._landing_decision.active
+            and self._landing_decision.release_allowed
+            and not self._landing_decision.coast_required
+            and not self._landing_release_blocked_by_slope
+            and 0.0 < signed_error <= LANDING_SAFETY_MARGIN_C + TRAJECTORY_COMPLETE_EPS_C
+            and cycle_min > 0.0
+            and temperature_slope_h is not None
+            and temperature_slope_h <= LANDING_RELEASE_SLOPE_H
+        )
+        if not eligible:
+            self._reset_landing_tracking_release()
+            return False
+
+        if self._landing_tracking_release_since is None:
+            self._landing_tracking_release_since = now_monotonic
+            self._landing_tracking_release_last = now_monotonic
+            self._landing_tracking_release_count = 1
+            return False
+        if now_monotonic <= self._landing_tracking_release_last:
+            # Repeated callbacks at one timestamp are not independent evidence.
+            return False
+
+        self._landing_tracking_release_last = now_monotonic
+        self._landing_tracking_release_count += 1
+        return (
+            self._landing_tracking_release_count >= LANDING_TRACKING_RELEASE_PERSISTENCE
+            and now_monotonic - self._landing_tracking_release_since
+            >= float(cycle_min) * 60.0
+        )
 
     def _clear_pending_target_change_braking(self) -> None:
         """Forget any delayed braking request inherited from a setpoint increase."""
@@ -392,18 +448,20 @@ class SmartPISetpointManager:
             predicted_change = (current_temp - ext_current_temp) * alpha
             return predicted_change if predicted_change > 0.0 else None
 
-        # Active mode: full 1R1C model (HEAT with a > 0, COOL with a < 0)
+        # Active mode: full 1R1C model (HEAT with a > 0, COOL with a < 0).
         if hvac_mode != VThermHvacMode_COOL and a <= 0.0:
             return None
 
         predicted_temp = current_temp
 
+        # The already committed command acts through the remaining cycle.
         current_horizon_min = max(float(horizon_min), 0.0)
         if current_horizon_min > 0.0:
             alpha_current = exp(-b * current_horizon_min)
             steady_state_temp = ext_current_temp + (a * max(float(u_ref), 0.0)) / b
             predicted_temp = steady_state_temp + (predicted_temp - steady_state_temp) * alpha_current
 
+        # A queued next-cycle command can further change room temperature.
         next_horizon_min = max(float(next_horizon_min), 0.0)
         if next_horizon_min > 0.0:
             alpha_next = exp(-b * next_horizon_min)
@@ -480,6 +538,8 @@ class SmartPISetpointManager:
         raw_signed_error_p = _signed_delta(target_temp, current_temp, hvac_mode)
         filtered_signed_error_p = _signed_delta(sp_for_p, current_temp, hvac_mode)
 
+        # Compare P after the same deadzone used by the controller. This
+        # handoff checks the reference change, not the total output command.
         raw_error_p_db = self._apply_signed_deadzone(raw_signed_error_p, deadband_c)
         filtered_error_p_db = self._apply_signed_deadzone(filtered_signed_error_p, deadband_c)
 
@@ -517,6 +577,7 @@ class SmartPISetpointManager:
         horizon_min: float,
     ) -> tuple[float, float, float]:
         """Return predicted temperature, passive term, and command gain."""
+        # T(h) = passive + gain_u * u for the first-order thermal model.
         horizon = max(float(horizon_min), LANDING_MIN_HORIZON_MIN)
         alpha = exp(-b * horizon)
         passive = ext_current_temp + (current_temp - ext_current_temp) * alpha
@@ -535,6 +596,7 @@ class SmartPISetpointManager:
         deadtime_cool_s: float | None,
         deadtime_cool_reliable: bool,
     ) -> tuple[bool, float | None]:
+        """Compare time to target at the measured slope with cooling dead time."""
         if signed_error <= 0.0:
             return True, None
         if temperature_slope_h is None or temperature_slope_h <= 0.0:
@@ -589,6 +651,7 @@ class SmartPISetpointManager:
             self._landing_non_constraining_count = 0
             return _inactive("target_reached")
         if signed_error >= TRAJECTORY_ENABLE_ERROR_THRESHOLD:
+            # A renewed large demand may start a fresh landing after release.
             self._landing_residual_released = False
             self._landing_non_constraining_count = 0
         if signed_error > LANDING_ENABLE_ERROR_THRESHOLD_C:
@@ -623,6 +686,7 @@ class SmartPISetpointManager:
             self._landing_non_constraining_count = 0
             return _inactive("trajectory_inactive")
         if self._landing_residual_released:
+            # Keep the cap off for this trajectory once residual release wins.
             return _inactive("residual_release")
 
         slope_release_safe, time_to_target_min = self._compute_landing_release_slope_safety(
@@ -644,6 +708,7 @@ class SmartPISetpointManager:
             and signed_error <= LANDING_SAFETY_MARGIN_C + TRAJECTORY_COMPLETE_EPS_C
             and flat_enough
         ):
+            # Only release phase can retire the cap on residual error alone.
             self._landing_residual_released = True
             return SetpointLandingDecision(reason="residual_release")
 
@@ -652,6 +717,7 @@ class SmartPISetpointManager:
         h2 = max(deadtime_cool_min, LANDING_MIN_HORIZON_MIN)
         target_margin = target_temp - LANDING_SAFETY_MARGIN_C
 
+        # Predict first with the committed power until the cycle boundary.
         t_after_h1, _, _ = self._predict_heat_temperature(
             current_temp=current_temp,
             ext_current_temp=ext_current_temp,
@@ -661,6 +727,8 @@ class SmartPISetpointManager:
             horizon_min=h1,
         )
 
+        # Solve for the next command that reaches the margin after cooling
+        # dead time. If even zero power exceeds it, coasting is required.
         _, passive, gain_u = self._predict_heat_temperature(
             current_temp=t_after_h1,
             ext_current_temp=ext_current_temp,
@@ -680,6 +748,8 @@ class SmartPISetpointManager:
         predicted_temperature = passive + gain_u * u_cap
         predicted_rise = predicted_temperature - current_temp
 
+        # Translate the command cap into a P-reference cap using the current
+        # FF and integral contributions; the actual command is capped in algo.
         integral_term = float(ki) * float(integral)
         available_p = u_cap - float(u_ff_eff) - integral_term
         error_p_db_cap = max(available_p / float(kp), 0.0)
@@ -703,6 +773,7 @@ class SmartPISetpointManager:
             and (slope_ok or time_safe)
         )
         if sp_for_p is not None:
+            # In release, retire a cap that no longer changes the P reference.
             if (
                 reason == "cap"
                 and residual_zone
@@ -774,6 +845,7 @@ class SmartPISetpointManager:
             return target_temp
 
         if current_temp is None:
+            self._reset_landing_tracking_release()
             return self.effective_setpoint if self.effective_setpoint is not None else target_temp
 
         if now_monotonic is None:
@@ -785,7 +857,7 @@ class SmartPISetpointManager:
         self._last_next_cycle_u_ref = max(float(next_cycle_u_ref), 0.0)
         self._last_bumpless_u_delta = None
         self._last_bumpless_ready = None
-        # Landing decision is recomputed every cycle; default is inactive.
+        # Diagnostics reflect this calculation, even if a prior cap was active.
         self._landing_decision = SetpointLandingDecision()
         self._reset_landing_release_safety()
 
@@ -799,6 +871,7 @@ class SmartPISetpointManager:
             previous_target = target_temp
 
         self._last_user_target_temp = target_temp
+        # Keep the requested target separate from the shaped P reference.
         self.filtered_setpoint = target_temp
 
         signed_error = _signed_delta(target_temp, current_temp, hvac_mode)
@@ -832,6 +905,8 @@ class SmartPISetpointManager:
         effective_rate = None
         model_ready = False
         if tau_reliable and deadtime_cool_min is not None:
+            # Predict across the current cycle remainder, the cooling delay,
+            # and any queued power at the start of the following cycle.
             braking_delay_min = deadtime_cool_min + max(remaining_cycle_min, 0.0)
             next_cycle_horizon_min = 0.0
             if next_cycle_u_ref > 0.0:
@@ -869,6 +944,8 @@ class SmartPISetpointManager:
             braking_gap = TRAJECTORY_BRAKE_GAIN * predicted_change
             braking_window = signed_error <= braking_gap
             if self.trajectory_active:
+                # Hysteresis avoids toggling an active trajectory at the edge
+                # of the predicted braking window.
                 braking_needed = (
                     signed_error <= (braking_gap + TRAJECTORY_BRAKE_RELEASE_HYST_C)
                     and signed_error > TRAJECTORY_COMPLETE_EPS_C
@@ -908,6 +985,7 @@ class SmartPISetpointManager:
                 min_signed_p_error=min_signed_p_error,
                 hvac_mode=hvac_mode,
             )
+            # Keep the braking time constant at least as long as the cooling delay.
             tau_brake_min = max(
                 deadtime_cool_min,
                 signed_error / max(effective_rate, 1e-6),
@@ -916,12 +994,15 @@ class SmartPISetpointManager:
         self._last_braking_needed = braking_needed
 
         if not self.trajectory_active and not braking_needed:
+            self._reset_landing_tracking_release()
             self.effective_setpoint = target_temp
             return target_temp
 
         entering_release = False
         release_locked = self._is_setpoint_release_locked()
         if not self.trajectory_active and braking_needed and tau_brake_min is not None:
+            # Remember whether the trajectory responds to a user target or
+            # a disturbance; only the former receives the HEAT landing cap.
             trajectory_source = (
                 "setpoint"
                 if self._pending_target_change_braking
@@ -937,6 +1018,8 @@ class SmartPISetpointManager:
             self._clear_pending_target_change_braking()
         elif self.trajectory_active:
             if release_locked:
+                # Once a setpoint response starts releasing, do not resume
+                # braking because of a later model prediction.
                 trajectory_phase = TrajectoryPhase.RELEASE
             else:
                 trajectory_phase = (
@@ -953,6 +1036,8 @@ class SmartPISetpointManager:
                 tau_target_min = None
             elif not braking_needed:
                 if entering_release:
+                    # Retarget the generator from its current value so the
+                    # filtered P reference returns smoothly to the raw target.
                     current_tau_ref = (
                         self._trajectory.tau_ref_min
                         or tau_brake_min
@@ -974,11 +1059,13 @@ class SmartPISetpointManager:
                 self._trajectory_source = "disturbance"
 
         if not self.trajectory_active:
+            self._reset_landing_tracking_release()
             self.effective_setpoint = target_temp
             return target_temp
 
         sp_for_p = self._trajectory.update(now_monotonic=now_monotonic)
         if sp_for_p is None:
+            self._reset_landing_tracking_release()
             self.effective_setpoint = target_temp
             return target_temp
 
@@ -986,6 +1073,8 @@ class SmartPISetpointManager:
             self.trajectory_phase == TrajectoryPhase.RELEASE
             and _signed_delta(sp_for_p, current_temp, hvac_mode) <= 0.0
         ):
+            # Keep the P reference on the demand side of the measured room
+            # temperature during the final approach.
             sp_for_p = current_temp + TRAJECTORY_COMPLETE_EPS_C
             if hvac_mode == VThermHvacMode_COOL:
                 sp_for_p = current_temp - TRAJECTORY_COMPLETE_EPS_C
@@ -1016,9 +1105,29 @@ class SmartPISetpointManager:
             self._landing_decision.active
             and self._landing_decision.sp_for_p_cap is not None
         ):
+            # The generator must remember the capped value for its next step.
             sp_for_p = min(sp_for_p, self._landing_decision.sp_for_p_cap)
             self._trajectory.current_setpoint = sp_for_p
 
+        if self._landing_tracking_release_ready(
+            hvac_mode=hvac_mode,
+            signed_error=signed_error,
+            temperature_slope_h=temperature_slope_h,
+            now_monotonic=now_monotonic,
+            cycle_min=cycle_min,
+        ):
+            # Keep this cycle's capped reference; the release target takes
+            # effect on the next generator update.
+            current_tau_ref = self._trajectory.tau_ref_min or deadtime_cool_min or 1e-6
+            self._trajectory.set_target(
+                target_temp,
+                tau_ref_min=max(current_tau_ref * self._release_tau_factor, 1e-6),
+                phase=TrajectoryPhase.RELEASE,
+            )
+            self._reset_landing_tracking_release()
+
+        # Finish only when both the room and P reference are near the target
+        # and the handoff cannot create a large proportional output step.
         if (
             not braking_needed
             and not entering_release
