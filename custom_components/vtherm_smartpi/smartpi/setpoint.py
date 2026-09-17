@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from math import exp
+from math import exp, isclose
 from typing import Optional
 
 from .const import (
@@ -16,6 +16,7 @@ from .const import (
     LANDING_RELEASE_TIME_TO_DEADTIME_RATIO,
     LANDING_RELEASE_TIME_TO_TARGET_EPS_MIN,
     LANDING_SAFETY_MARGIN_C,
+    LANDING_TEMPERATURE_COMPARISON_EPS_C,
     LANDING_U_EPS,
     SETPOINT_BOOST_THRESHOLD,
     SETPOINT_BOOST_ERROR_MIN,
@@ -42,6 +43,17 @@ def _signed_delta(value: float, reference: float, hvac_mode: VThermHvacMode | No
     if hvac_mode == VThermHvacMode_COOL:
         return -delta
     return delta
+
+
+def _is_within_landing_residual_zone(signed_error: float) -> bool:
+    """Return whether error is inside the inclusive landing release boundary."""
+    limit = LANDING_SAFETY_MARGIN_C + TRAJECTORY_COMPLETE_EPS_C
+    return signed_error < limit or isclose(
+        signed_error,
+        limit,
+        rel_tol=0.0,
+        abs_tol=LANDING_TEMPERATURE_COMPARISON_EPS_C,
+    )
 
 
 @dataclass(slots=True)
@@ -292,7 +304,8 @@ class SmartPISetpointManager:
             and self._landing_decision.release_allowed
             and not self._landing_decision.coast_required
             and not self._landing_release_blocked_by_slope
-            and 0.0 < signed_error <= LANDING_SAFETY_MARGIN_C + TRAJECTORY_COMPLETE_EPS_C
+            and signed_error > 0.0
+            and _is_within_landing_residual_zone(signed_error)
             and cycle_min > 0.0
             and temperature_slope_h is not None
             and temperature_slope_h <= LANDING_RELEASE_SLOPE_H
@@ -705,7 +718,7 @@ class SmartPISetpointManager:
 
         if (
             self.trajectory_phase == TrajectoryPhase.RELEASE
-            and signed_error <= LANDING_SAFETY_MARGIN_C + TRAJECTORY_COMPLETE_EPS_C
+            and _is_within_landing_residual_zone(signed_error)
             and flat_enough
         ):
             # Only release phase can retire the cap on residual error alone.
@@ -766,7 +779,7 @@ class SmartPISetpointManager:
 
         reason = "coast" if coast_required else "cap"
 
-        residual_zone = signed_error <= LANDING_SAFETY_MARGIN_C + TRAJECTORY_COMPLETE_EPS_C
+        residual_zone = _is_within_landing_residual_zone(signed_error)
         release_allowed = (
             not coast_required
             and residual_zone

@@ -11,6 +11,7 @@ from custom_components.vtherm_smartpi.smartpi.const import (
     AB_MIN_SAMPLES_B,
     LANDING_NON_CONSTRAINING_PERSISTENCE,
     LANDING_SAFETY_MARGIN_C,
+    TRAJECTORY_COMPLETE_EPS_C,
     TRAJECTORY_ENABLE_ERROR_THRESHOLD,
     TrajectoryPhase,
 )
@@ -863,6 +864,14 @@ class TestSetpointLanding:
         assert manager.trajectory_phase == TrajectoryPhase.TRACKING
         assert manager._landing_tracking_release_count == 1
 
+    def test_tracking_release_candidate_accepts_decimal_residual_boundary(self):
+        manager = self._tracking_plateau_manager()
+        for now in (0.0, 60.0, 120.0):
+            self._tracking_plateau_step(manager, now, current=24.9)
+
+        assert 25.0 - 24.9 > LANDING_SAFETY_MARGIN_C + TRAJECTORY_COMPLETE_EPS_C
+        assert manager.trajectory_phase == TrajectoryPhase.RELEASE
+
     def test_missing_temperature_resets_tracking_release_candidate(self):
         manager = self._tracking_plateau_manager()
         self._tracking_plateau_step(manager, 0.0)
@@ -1018,6 +1027,52 @@ class TestSetpointLanding:
 
         assert decision.active is False
         assert decision.reason == "residual_release"
+
+    def test_landing_residual_boundary_includes_decimal_temperature_difference(self):
+        manager = _make_manager()
+        manager._trajectory_source = "setpoint"
+        manager._trajectory.start(
+            start_setpoint=21.9,
+            target_setpoint=22.0,
+            tau_ref_min=10.0,
+            now_monotonic=0.0,
+        )
+        manager._trajectory.set_target(22.0, phase=TrajectoryPhase.RELEASE)
+
+        decision = _decision(
+            manager,
+            target_temp=22.0,
+            current_temp=21.9,
+            signed_error=22.0 - 21.9,
+            temperature_slope_h=0.01,
+        )
+
+        assert 22.0 - 21.9 > LANDING_SAFETY_MARGIN_C + TRAJECTORY_COMPLETE_EPS_C
+        assert decision.active is False
+        assert decision.reason == "residual_release"
+
+    def test_landing_residual_boundary_rejects_materially_larger_error(self):
+        manager = _make_manager()
+        manager._trajectory_source = "setpoint"
+        manager._trajectory.start(
+            start_setpoint=21.9,
+            target_setpoint=22.0,
+            tau_ref_min=10.0,
+            now_monotonic=0.0,
+        )
+        manager._trajectory.set_target(22.0, phase=TrajectoryPhase.RELEASE)
+
+        decision = _decision(
+            manager,
+            target_temp=22.0,
+            current_temp=21.899999,
+            signed_error=22.0 - 21.899999,
+            temperature_slope_h=0.01,
+        )
+
+        assert decision.active is True
+        assert decision.reason == "cap"
+        assert decision.release_allowed is False
 
     def test_landing_residual_release_is_sticky_until_demand_recovers(self):
         manager = _make_manager()
