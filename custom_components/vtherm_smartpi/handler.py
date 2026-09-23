@@ -287,7 +287,6 @@ class SmartPIHandler:
 
                 if profile is not None:
                     self._profiles[profile] = data
-                    self._active_profile = profile
 
                     _LOGGER.info(
                         "%s - Migrated legacy SmartPI state into %s profile",
@@ -340,6 +339,8 @@ class SmartPIHandler:
     async def _async_save(self):
         """Save SmartPI state to the active seasonal profile."""
 
+        t = self._thermostat
+
         _LOGGER.warning(
             "%s - DEBUG before save: hvac=%s active=%s loaded=%s profiles=%s",
             t,
@@ -351,7 +352,6 @@ class SmartPIHandler:
                 for key, value in self._profiles.items()
             },
         )
-        t = self._thermostat
 
         if not self._store or not t.prop_algorithm:
             return
@@ -359,17 +359,31 @@ class SmartPIHandler:
         try:
             profile = self._profile_key(t.vtherm_hvac_mode)
 
-            # While OFF, the algorithm still represents the last active
-            # seasonal profile.
+            # While OFF, the live algorithm still belongs to the last profile
+            # that was actually loaded/used.
             if profile is None:
                 profile = self._active_profile
 
-            if profile is not None:
-                self._profiles[profile] = t.prop_algorithm.save_state()
-                self._active_profile = profile
+            # Nothing seasonal has been loaded into the live algorithm yet.
+            # Do not overwrite stored profiles with a fresh startup algorithm.
+            if profile is None:
+                return
+
+            _LOGGER.warning(
+                "%s - DEBUG actual save: hvac=%s active=%s profiles=%s",
+                t,
+                t.vtherm_hvac_mode,
+                self._active_profile,
+                {
+                    key: len(str(value))
+                    for key, value in self._profiles.items()
+                },
+            )
+
+            self._profiles[profile] = t.prop_algorithm.save_state()
+            self._active_profile = profile
 
             data = self._build_profile_store()
-
             t.hass.async_create_task(self._store.async_save(data))
 
             _LOGGER.debug(
