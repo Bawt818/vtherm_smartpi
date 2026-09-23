@@ -489,6 +489,10 @@ class SmartPIHandler:
             force = False
 
         if t.prop_algorithm:
+            # Select/restore the correct seasonal HEAT/COOL model before
+            # SmartPI processes the current HVAC mode.
+            self._ensure_active_profile()
+
             # Learning update
             current_temp = t.current_temperature
 
@@ -886,3 +890,75 @@ class SmartPIHandler:
             and data.get("profile_store_version") == SMARTPI_PROFILE_STORE_VERSION
             and isinstance(data.get("profiles"), dict)
         )
+
+    def _ensure_active_profile(self) -> None:
+        """Ensure SmartPI is using the profile for the current HVAC mode."""
+        t = self._thermostat
+        algo = t.prop_algorithm
+
+        if algo is None:
+            return
+
+        wanted = self._profile_key(t.vtherm_hvac_mode)
+
+        # OFF is not a separate model.
+        if wanted is None:
+            return
+
+        # Already using the correct seasonal model.
+        if wanted == self._active_profile:
+            return
+
+        # Preserve the model we're leaving.
+        if self._active_profile is not None:
+            self._profiles[self._active_profile] = algo.save_state()
+
+            _LOGGER.debug(
+                "%s - SmartPI %s profile saved before switching to %s",
+                t,
+                self._active_profile,
+                wanted,
+            )
+
+        # Handle an old persisted state whose mode could not be identified.
+        # Assign it to the first active mode after upgrade, matching the old
+        # single-model behaviour as closely as possible.
+        if (
+            wanted not in self._profiles
+            and self._unassigned_legacy_state is not None
+        ):
+            self._profiles[wanted] = self._unassigned_legacy_state
+            self._unassigned_legacy_state = None
+
+            _LOGGER.info(
+                "%s - Assigned unclassified legacy SmartPI state to %s profile",
+                t,
+                wanted,
+            )
+
+        # Restore an existing profile if we have one.
+        if wanted in self._profiles:
+            algo.load_state(self._profiles[wanted])
+
+            _LOGGER.info(
+                "%s - SmartPI seasonal profile switched to %s",
+                t,
+                wanted,
+            )
+
+        else:
+            # Important:
+            # Do NOT reset the algorithm here.
+            #
+            # SmartPI's existing ensure_hvac_mode() logic will see the
+            # HEAT<->COOL transition during calculate(), discard the old
+            # mode-dependent A state, FF trim/twin where appropriate,
+            # and retain the reusable passive B model.
+            _LOGGER.info(
+                "%s - No saved SmartPI %s profile; "
+                "initializing it from the current reusable model",
+                t,
+                wanted,
+            )
+
+        self._active_profile = wanted
