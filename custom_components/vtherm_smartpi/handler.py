@@ -1,6 +1,7 @@
 # pylint: disable=line-too-long, abstract-method
 """SmartPI algorithm handler for the plugin runtime."""
 
+import copy
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -337,61 +338,35 @@ class SmartPIHandler:
         await self.on_state_changed(True)
 
     async def _async_save(self):
-        """Save SmartPI state to the active seasonal profile."""
-
+        """Save SmartPI state to the profile actually loaded in memory."""
         t = self._thermostat
-
-        _LOGGER.warning(
-            "%s - DEBUG before save: hvac=%s active=%s loaded=%s profiles=%s",
-            t,
-            t.vtherm_hvac_mode,
-            self._active_profile,
-            self._profiles_loaded,
-            {
-                key: len(str(value))
-                for key, value in self._profiles.items()
-            },
-        )
 
         if not self._store or not t.prop_algorithm:
             return
 
+        active_profile = self._active_profile
+
+        if active_profile is None:
+            return
+
         try:
-            profile = self._profile_key(t.vtherm_hvac_mode)
+            state = t.prop_algorithm.save_state()
+            state_profile = self._profile_from_algorithm_state(state)
 
-            # While OFF, the live algorithm still belongs to the last profile
-            # that was actually loaded/used.
-            if profile is None:
-                profile = self._active_profile
-
-            # Nothing seasonal has been loaded into the live algorithm yet.
-            # Do not overwrite stored profiles with a fresh startup algorithm.
-            if profile is None:
+            if state_profile != active_profile:
+                _LOGGER.warning(
+                    "%s - Refusing SmartPI profile save: "
+                    "active=%s but live model=%s",
+                    t,
+                    active_profile,
+                    state_profile,
+                )
                 return
 
-            _LOGGER.warning(
-                "%s - DEBUG actual save: hvac=%s active=%s profiles=%s",
-                t,
-                t.vtherm_hvac_mode,
-                self._active_profile,
-                {
-                    key: len(str(value))
-                    for key, value in self._profiles.items()
-                },
-            )
-
-            self._profiles[profile] = t.prop_algorithm.save_state()
-            self._active_profile = profile
+            self._profiles[active_profile] = state
 
             data = self._build_profile_store()
             t.hass.async_create_task(self._store.async_save(data))
-
-            _LOGGER.debug(
-                "%s - SmartPI seasonal state saved (active=%s, profiles=%s)",
-                t,
-                self._active_profile,
-                list(self._profiles.keys()),
-            )
 
         except Exception as e:
             _LOGGER.error("%s - Failed to save SmartPI state: %s", t, e)
@@ -934,7 +909,7 @@ class SmartPIHandler:
         """Build the outer persistence envelope containing seasonal profiles."""
         return {
             "profile_store_version": SMARTPI_PROFILE_STORE_VERSION,
-            "profiles": self._profiles,
+            "profiles": copy.deepcopy(self._profiles),
         }
 
 
@@ -968,15 +943,22 @@ class SmartPIHandler:
             return
 
         # Preserve the model we're leaving.
-        if self._active_profile is not None:
-            self._profiles[self._active_profile] = algo.save_state()
+        active_profile = self._active_profile
 
-            _LOGGER.debug(
-                "%s - SmartPI %s profile saved before switching to %s",
-                t,
-                self._active_profile,
-                wanted,
-            )
+        if active_profile is not None:
+            state = algo.save_state()
+            state_profile = self._profile_from_algorithm_state(state)
+
+            if state_profile == active_profile:
+                self._profiles[active_profile] = state
+            else:
+                _LOGGER.warning(
+                    "%s - Not saving outgoing SmartPI profile %s: "
+                    "live algorithm reports %s",
+                    t,
+                    active_profile,
+                    state_profile,
+                )
 
         # Handle an old persisted state whose mode could not be identified.
         # Assign it to the first active mode after upgrade, matching the old
@@ -996,7 +978,7 @@ class SmartPIHandler:
 
         # Restore an existing profile if we have one.
         if wanted in self._profiles:
-            algo.load_state(self._profiles[wanted])
+            algo.load_state(copy.deepcopy(self._profiles[wanted]))
 
             _LOGGER.info(
                 "%s - SmartPI seasonal profile switched to %s",
