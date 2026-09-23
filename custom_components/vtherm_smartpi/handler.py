@@ -242,7 +242,7 @@ class SmartPIHandler:
         try:
             data = await self._store.async_load()
 
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "%s - DEBUG SmartPI storage loaded: type=%s, keys=%s",
                 t,
                 type(data).__name__,
@@ -277,8 +277,8 @@ class SmartPIHandler:
             else:
                 profile = self._profile_from_algorithm_state(data)
 
-                _LOGGER.warning(
-                    "%s - DEBUG legacy state detected profile=%s, est_mode=%s",
+                _LOGGER.info(
+                    "%s - Legacy state detected profile=%s, est_mode=%s",
                     t,
                     profile,
                     data.get("est_state", {}).get("model_hvac_mode")
@@ -952,7 +952,7 @@ class SmartPIHandler:
             if state_profile == active_profile:
                 self._profiles[active_profile] = state
             else:
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "%s - Not saving outgoing SmartPI profile %s: "
                     "live algorithm reports %s",
                     t,
