@@ -248,7 +248,7 @@ class SmartPIHandler:
                 if data is not None:
                     t.hass.async_create_task(self._store.async_save(data))
 
-            if not data or not t.prop_algorithm:
+            if not data:
                 return
 
             # New seasonal-profile format.
