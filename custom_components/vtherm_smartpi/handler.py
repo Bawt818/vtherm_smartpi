@@ -85,6 +85,7 @@ class SmartPIHandler:
         self._profiles: dict[str, dict] = {}
         self._active_profile: str | None = None
         self._unassigned_legacy_state: dict | None = None
+        self._profiles_loaded = False
 
     def init_algorithm(self):
         """Initialize SmartPI algorithm."""
@@ -298,12 +299,18 @@ class SmartPIHandler:
 
         except Exception as e:
             _LOGGER.error("%s - Failed to load SmartPI state: %s", t, e)
+        finally:
+            self._profiles_loaded = True
 
     async def async_startup(self):
         """Startup actions."""
-        # Initialize the cycle start state if possible to enable first-cycle learning
         t = self._thermostat
+
         if t.prop_algorithm and isinstance(t.prop_algorithm, SmartPI):
+            # Restore/select the correct seasonal model before any startup
+            # recalculation or cycle management can occur.
+            self._ensure_active_profile()
+
             # Check availability of sensors
             if t.current_temperature is not None and t.current_outdoor_temperature is not None:
                 _LOGGER.debug("%s - SmartPI startup: ready for cycle management", t)
@@ -321,8 +328,11 @@ class SmartPIHandler:
         try:
             profile = self._profile_key(t.vtherm_hvac_mode)
 
-            # OFF is not a separate thermal model.
-            # Keep the most recently active HEAT/COOL profile untouched.
+            # While OFF, the algorithm still represents the last active
+            # seasonal profile.
+            if profile is None:
+                profile = self._active_profile
+
             if profile is not None:
                 self._profiles[profile] = t.prop_algorithm.save_state()
                 self._active_profile = profile
@@ -893,6 +903,9 @@ class SmartPIHandler:
 
     def _ensure_active_profile(self) -> None:
         """Ensure SmartPI is using the profile for the current HVAC mode."""
+        if not self._profiles_loaded:
+            return
+
         t = self._thermostat
         algo = t.prop_algorithm
 
