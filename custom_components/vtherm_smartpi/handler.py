@@ -241,6 +241,13 @@ class SmartPIHandler:
         try:
             data = await self._store.async_load()
 
+            _LOGGER.warning(
+                "%s - DEBUG SmartPI storage loaded: type=%s, keys=%s",
+                t,
+                type(data).__name__,
+                list(data.keys()) if isinstance(data, dict) else None,
+            )
+
             # Existing legacy storage-key migration already present in SmartPI.
             if data is None and self._legacy_store is not None:
                 data = await self._legacy_store.async_load()
@@ -255,16 +262,28 @@ class SmartPIHandler:
             if self._is_profile_store(data):
                 self._profiles = dict(data.get("profiles", {}))
 
-                _LOGGER.info(
-                    "%s - SmartPI seasonal profiles loaded: %s",
+                _LOGGER.warning(
+                    "%s - DEBUG loaded seasonal profiles: %s",
                     t,
-                    list(self._profiles.keys()),
+                    {
+                        key: len(str(value))
+                        for key, value in self._profiles.items()
+                    },
                 )
 
             # Old SmartPI format: migrate the whole existing state into
             # the profile indicated by its persisted estimator HVAC mode.
             else:
                 profile = self._profile_from_algorithm_state(data)
+
+                _LOGGER.warning(
+                    "%s - DEBUG legacy state detected profile=%s, est_mode=%s",
+                    t,
+                    profile,
+                    data.get("est_state", {}).get("model_hvac_mode")
+                    if isinstance(data, dict)
+                    else None,
+                )
 
                 if profile is not None:
                     self._profiles[profile] = data
@@ -320,6 +339,18 @@ class SmartPIHandler:
 
     async def _async_save(self):
         """Save SmartPI state to the active seasonal profile."""
+
+        _LOGGER.warning(
+            "%s - DEBUG before save: hvac=%s active=%s loaded=%s profiles=%s",
+            t,
+            t.vtherm_hvac_mode,
+            self._active_profile,
+            self._profiles_loaded,
+            {
+                key: len(str(value))
+                for key, value in self._profiles.items()
+            },
+        )
         t = self._thermostat
 
         if not self._store or not t.prop_algorithm:
